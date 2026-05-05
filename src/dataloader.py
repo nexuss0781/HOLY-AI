@@ -400,12 +400,12 @@ def create_dataloader(
             text_column=text_column,
         )
     
-    # Collate function for variable length sequences
+    # Collate function for variable length sequences - optimized for CPU
     def collate_fn(batch):
         input_ids = [item['input_ids'] for item in batch]
         labels = [item['labels'] for item in batch]
         
-        # Pad to max length in batch
+        # Pad to max length in batch (more efficient than fixed length)
         input_ids = torch.nn.utils.rnn.pad_sequence(
             input_ids, batch_first=True, padding_value=tokenizer.pad_token_id
         )
@@ -423,10 +423,11 @@ def create_dataloader(
     
     loader_kwargs = {
         'batch_size': batch_size,
-        'num_workers': num_workers,
+        'num_workers': num_workers,  # 0 for single-process on 2-core CPU
         'collate_fn': collate_fn,
-        'pin_memory': True,
-        'persistent_workers': num_workers > 0,
+        'pin_memory': False,  # No benefit on CPU
+        'persistent_workers': False if num_workers == 0 else (num_workers > 0),
+        'prefetch_factor': 2 if num_workers > 0 else None,
         **kwargs
     }
     
