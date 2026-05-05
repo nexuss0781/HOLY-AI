@@ -234,7 +234,6 @@ def main():
         gradient_checkpointing=args.gradient_checkpointing,
         optim=args.optim,
         lr_scheduler_type='linear',
-        no_cuda=True,  # Force CPU usage
         tf32=False,  # Not relevant for CPU
         dataloader_prefetch_factor=2 if args.num_workers > 0 else None,
         prediction_loss_only=False,
