@@ -169,7 +169,7 @@ class AutoIngestDataset(Dataset):
         return all_texts
     
     def _tokenize_all(self, num_workers: int = 1) -> List[torch.Tensor]:
-        """Tokenize all text data."""
+        """Tokenize all text data with fixed length."""
         print(f"Tokenizing {len(self.data)} samples...")
         
         tokenized = []
@@ -181,7 +181,7 @@ class AutoIngestDataset(Dataset):
                 text,
                 truncation=True,
                 max_length=self.max_length,
-                padding=False,
+                padding='max_length',  # Pad to max_length for consistent batching
                 return_tensors='pt'
             )
             
@@ -199,7 +199,8 @@ class AutoIngestDataset(Dataset):
         item = self.tokenized_data[idx]
         return {
             'input_ids': item,
-            'labels': item.clone()
+            'labels': item.clone(),
+            'attention_mask': torch.ones_like(item)  # Add attention mask for padded sequences
         }
 
 
