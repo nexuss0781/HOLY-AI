@@ -109,13 +109,22 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument('--max_grad_norm', type=float, default=1.0,
                         help='Maximum gradient norm for clipping')
     
-    # Performance arguments
-    parser.add_argument('--fp16', action='store_true',
-                        help='Use mixed precision training')
-    parser.add_argument('--num_workers', type=int, default=4,
-                        help='Number of data loading workers')
+    # Performance arguments - optimized for CPU-only 2-core systems
+    parser.add_argument('--fp16', action='store_true', default=False,
+                        help='Use mixed precision training (disabled for CPU)')
+    parser.add_argument('--num_workers', type=int, default=0,
+                        help='Number of data loading workers (0 for single-process, optimal for 2-core CPU)')
     parser.add_argument('--streaming', action='store_true',
                         help='Use streaming mode for large datasets')
+    parser.add_argument('--bf16', action='store_true', default=False,
+                        help='Use bfloat16 precision (if supported by CPU)')
+    parser.add_argument('--optim', type=str, default='adamw_torch',
+                        choices=['adamw_torch', 'adamw_hf', 'sgd', 'adafactor'],
+                        help='Optimizer to use')
+    parser.add_argument('--gradient_checkpointing', action='store_true',
+                        help='Enable gradient checkpointing to save memory')
+    parser.add_argument('--compile', action='store_true',
+                        help='Use torch.compile for faster training (PyTorch 2.0+)')
     
     # Logging and checkpointing
     parser.add_argument('--logging_steps', type=int, default=100,
@@ -195,7 +204,13 @@ def main():
     dataset = dataloader.dataset
     logger.info(f"Dataset size: {len(dataset):,} samples")
     
-    # Setup training arguments
+    # Setup training arguments - optimized for CPU 2-core systems
+    device = 'cpu'
+    
+    # Detect CPU capabilities
+    use_bf16 = args.bf16 and torch.cuda.is_available() and torch.cuda.is_bf16_supported()
+    use_fp16 = args.fp16 and not use_bf16  # FP16 typically not beneficial on CPU
+    
     training_args = TrainingArguments(
         output_dir=args.output_dir,
         num_train_epochs=args.num_train_epochs,
@@ -205,7 +220,8 @@ def main():
         weight_decay=args.weight_decay,
         max_grad_norm=args.max_grad_norm,
         warmup_steps=args.warmup_steps,
-        fp16=args.fp16,
+        fp16=use_fp16,
+        bf16=use_bf16,
         logging_steps=args.logging_steps,
         save_steps=args.save_steps,
         save_total_limit=args.save_total_limit,
@@ -213,11 +229,23 @@ def main():
         logging_dir=os.path.join(args.output_dir, 'logs'),
         report_to=[],  # Disable wandb/tensorboard by default
         seed=args.seed,
-        dataloader_num_workers=args.num_workers,
-        dataloader_pin_memory=True,
-        gradient_checkpointing=False,
-        optim='adamw_torch',
+        dataloader_num_workers=args.num_workers,  # 0 for single-process (optimal for 2-core)
+        dataloader_pin_memory=False,  # No benefit on CPU
+        gradient_checkpointing=args.gradient_checkpointing,
+        optim=args.optim,
         lr_scheduler_type='linear',
+        no_cuda=True,  # Force CPU usage
+        tf32=False,  # Not relevant for CPU
+        dataloader_prefetch_factor=2 if args.num_workers > 0 else None,
+        prediction_loss_only=False,
+        remove_unused_columns=False,  # Keep all columns for proper handling
+        group_by_length=False,  # Don't group by length (variable length handled by collator)
+        ddp_find_unused_parameters=None,
+        skip_memory_metrics=True,  # Skip memory metrics on CPU
+        include_inputs_for_metrics=False,
+        eval_on_start=False,
+        metric_for_best_model=None,
+        greater_is_better=None,
     )
     
     # Data collator
@@ -226,13 +254,19 @@ def main():
         mlm=False,  # GPT-2 is causal LM, not masked LM
     )
     
-    # Initialize Trainer
+    # Initialize Trainer with CPU optimizations
     trainer = Trainer(
         model=model,
         args=training_args,
         train_dataset=dataset,
         data_collator=data_collator,
     )
+    
+    # Apply torch.compile for faster training if requested (PyTorch 2.0+)
+    if args.compile and hasattr(torch, 'compile'):
+        logger.info("Applying torch.compile for faster training...")
+        trainer.model = torch.compile(trainer.model, mode='reduce-overhead')
+        logger.info("torch.compile applied successfully")
     
     # Remove default progress callback and add custom one
     trainer.remove_callback(ProgressCallback)
