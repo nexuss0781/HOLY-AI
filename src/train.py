@@ -241,7 +241,6 @@ def main():
         group_by_length=False,  # Don't group by length (variable length handled by collator)
         ddp_find_unused_parameters=None,
         skip_memory_metrics=True,  # Skip memory metrics on CPU
-        include_inputs_for_metrics=False,
         eval_on_start=False,
         metric_for_best_model=None,
         greater_is_better=None,
