@@ -32,17 +32,25 @@ class AutoIngestDataset(Dataset):
         text_column: Optional[str] = None,
         preprocessing_num_workers: int = 1,
     ):
-        self.data_dir = Path(data_dir)
+        self.data_dir = Path(data_dir).resolve()
         self.tokenizer = tokenizer
         self.max_length = max_length
         self.text_column = text_column
         
         if not self.data_dir.exists():
-            raise FileNotFoundError(f"Data directory {data_dir} does not exist")
+            # Try to create it if it doesn't exist
+            try:
+                self.data_dir.mkdir(parents=True, exist_ok=True)
+                print(f"Created data directory: {self.data_dir}")
+            except Exception as e:
+                raise FileNotFoundError(f"Data directory {self.data_dir} does not exist and cannot be created: {e}")
         
         # Discover all files
         self.files = self._discover_files()
         print(f"Discovered {len(self.files)} files to process")
+        
+        if len(self.files) == 0:
+            raise FileNotFoundError(f"No supported data files found in {self.data_dir}. Supported formats: .parquet, .json, .jsonl, .csv, .txt")
         
         # Load all data
         self.data = self._load_all_data()
