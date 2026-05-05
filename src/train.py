@@ -1,17 +1,33 @@
 """
-High-quality GPT-2 Training Script
+Production-Ready GPT-2 Training Script
 
-Features:
+Advanced Features:
 - Automatic data ingestion from data/ directory (parquet, json, csv, txt)
-- Mixed precision training (AMP)
-- Gradient accumulation
-- Learning rate scheduling with warmup
-- Checkpoint saving
-- Logging with tqdm and optional wandb
-- Configurable via command-line arguments
+- Mixed precision training (AMP) with BF16 support
+- Gradient accumulation and checkpointing
+- Advanced learning rate scheduling with warmup
+- Production-grade checkpointing system with metadata
+- Real-time metrics tracking and export
+- Configuration management (YAML/JSON)
+- Early stopping and validation
+- Performance profiling
+- Memory monitoring
+- Resume capability with full state restoration
+- Async checkpoint saving
+- Experiment tracking and comparison
 
 Usage:
+    # Basic training
     python train.py --output_dir ./models/gpt2-finetuned --num_train_epochs 3 --batch_size 8
+    
+    # With config file
+    python train.py --config config.yaml
+    
+    # Resume from checkpoint
+    python train.py --resume_from_checkpoint ./models/gpt2-finetuned/checkpoints/checkpoint-xxxxx
+    
+    # Enable profiling
+    python train.py --profile --output_dir ./models/gpt2-profiled
 
 One-line training command after setup:
     python train.py --output_dir ./models/my-gpt2 --num_train_epochs 3
@@ -21,9 +37,13 @@ import os
 import sys
 import argparse
 import logging
+import time
+import traceback
 from pathlib import Path
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, List
 from datetime import datetime
+import signal
+import atexit
 
 import torch
 from torch.utils.data import DataLoader
@@ -36,12 +56,173 @@ from transformers import (
     DataCollatorForLanguageModeling,
     get_linear_schedule_with_warmup,
 )
-from transformers.trainer_callback import TrainerCallback, ProgressCallback
+from transformers.trainer_callback import TrainerCallback, ProgressCallback, TrainerControl, TrainerState
 import numpy as np
 
-# Import custom dataloader
+# Import custom modules
 sys.path.insert(0, str(Path(__file__).parent))
 from dataloader import create_dataloader, AutoIngestDataset
+from config import ExperimentConfig, get_default_config, TrainingConfig
+from checkpoint import CheckpointManager, resume_from_checkpoint
+from metrics import MetricsTracker
+
+
+class ProductionTrainerCallback(TrainerCallback):
+    """
+    Advanced callback for production training with checkpointing and metrics.
+    """
+    
+    def __init__(
+        self,
+        checkpoint_manager: CheckpointManager,
+        metrics_tracker: MetricsTracker,
+        model_config: Dict[str, Any],
+        training_config: Dict[str, Any],
+        early_stopping: bool = False,
+        early_stopping_patience: int = 3,
+        early_stopping_threshold: float = 0.0,
+    ):
+        self.checkpoint_manager = checkpoint_manager
+        self.metrics_tracker = metrics_tracker
+        self.model_config = model_config
+        self.training_config = training_config
+        self.early_stopping = early_stopping
+        self.early_stopping_patience = early_stopping_patience
+        self.early_stopping_threshold = early_stopping_threshold
+        
+        self.best_loss = float('inf')
+        self.patience_counter = 0
+        self.epoch_start_time = None
+        self.last_global_step = 0
+    
+    def on_train_begin(self, args, state, control, **kwargs):
+        """Initialize tracking at training start."""
+        self.metrics_tracker.start_tracking()
+        print("\n" + "="*60)
+        print("TRAINING STARTED")
+        print("="*60)
+    
+    def on_epoch_begin(self, args, state, control, **kwargs):
+        """Track epoch start time."""
+        self.epoch_start_time = time.time()
+    
+    def on_step_end(self, args, state, control, **kwargs):
+        """Log metrics and handle checkpointing at each step."""
+        if state.global_step <= self.last_global_step:
+            return control
+        
+        self.last_global_step = state.global_step
+        
+        # Get current metrics
+        logs = kwargs.get('logs', {})
+        loss = logs.get('loss', 0)
+        learning_rate = logs.get('learning_rate', args.learning_rate)
+        
+        # Calculate throughput
+        elapsed = time.time() - self.epoch_start_time if self.epoch_start_time else 0
+        steps_in_epoch = state.global_step % args.num_train_epochs
+        samples_per_second = (args.per_device_train_batch_size * args.gradient_accumulation_steps * steps_in_epoch / elapsed) if elapsed > 0 else 0
+        
+        # Get memory usage
+        gpu_memory = 0.0
+        if torch.cuda.is_available():
+            gpu_memory = torch.cuda.memory_allocated() / 1e6
+        
+        # Log to metrics tracker
+        self.metrics_tracker.log(
+            global_step=state.global_step,
+            epoch=state.epoch,
+            loss=loss,
+            learning_rate=learning_rate,
+            samples_per_second=samples_per_second,
+            gpu_memory_mb=gpu_memory,
+        )
+        
+        # Handle checkpointing
+        if state.global_step % args.save_steps == 0 and args.save_steps > 0:
+            print(f"\n\nSaving checkpoint at step {state.global_step}...")
+            
+            try:
+                self.checkpoint_manager.save_checkpoint(
+                    model=kwargs.get('model'),
+                    optimizer=kwargs.get('optimizer'),
+                    scheduler=kwargs.get('lr_scheduler'),
+                    global_step=state.global_step,
+                    epoch=state.epoch,
+                    loss=loss,
+                    learning_rate=learning_rate,
+                    model_config=self.model_config,
+                    training_config=self.training_config,
+                )
+            except Exception as e:
+                print(f"Warning: Checkpoint saving failed: {e}")
+        
+        # Early stopping check
+        if self.early_stopping and loss < self.best_loss - self.early_stopping_threshold:
+            self.best_loss = loss
+            self.patience_counter = 0
+        elif self.early_stopping:
+            self.patience_counter += 1
+            if self.patience_counter >= self.early_stopping_patience:
+                print(f"\n\nEarly stopping triggered after {self.patience_counter} steps without improvement")
+                control.should_training_stop = True
+        
+        return control
+    
+    def on_epoch_end(self, args, state, control, **kwargs):
+        """Handle end-of-epoch tasks."""
+        elapsed = time.time() - self.epoch_start_time if self.epoch_start_time else 0
+        print(f"\n\n✓ Epoch {int(state.epoch)} completed in {elapsed:.1f}s")
+        
+        # Save epoch checkpoint
+        logs = kwargs.get('logs', {})
+        loss = logs.get('loss', 0)
+        learning_rate = logs.get('learning_rate', args.learning_rate)
+        
+        try:
+            self.checkpoint_manager.save_checkpoint(
+                model=kwargs.get('model'),
+                optimizer=kwargs.get('optimizer'),
+                scheduler=kwargs.get('lr_scheduler'),
+                global_step=state.global_step,
+                epoch=state.epoch,
+                loss=loss,
+                learning_rate=learning_rate,
+                model_config=self.model_config,
+                training_config=self.training_config,
+                notes=f"Epoch {int(state.epoch)} end",
+            )
+        except Exception as e:
+            print(f"Warning: Epoch checkpoint saving failed: {e}")
+        
+        return control
+    
+    def on_train_end(self, args, state, control, **kwargs):
+        """Finalize training and export metrics."""
+        print("\n\n" + "="*60)
+        print("TRAINING COMPLETED")
+        print("="*60)
+        
+        # Export metrics
+        self.metrics_tracker.export_csv()
+        self.metrics_tracker.export_json()
+        
+        # Generate plot if matplotlib available
+        try:
+            self.metrics_tracker.plot_losses(
+                output_path=os.path.join(args.output_dir, 'training_loss.png')
+            )
+        except Exception as e:
+            print(f"Note: Could not generate loss plot: {e}")
+        
+        # Print summary
+        summary = self.metrics_tracker.get_metrics_summary()
+        print("\nTraining Summary:")
+        print(f"  Total steps: {summary.get('total_steps', 0)}")
+        print(f"  Final loss: {summary.get('final_loss', 0):.4f}")
+        print(f"  Best loss: {summary.get('min_loss', 0):.4f}")
+        print(f"  Avg step time: {summary.get('avg_step_time', 0):.3f}s")
+        print(f"  Steps/second: {summary.get('steps_per_second', 0):.2f}")
 
 
 class CustomProgressCallback(ProgressCallback):
@@ -76,7 +257,14 @@ def setup_logging(output_dir: str):
 
 def parse_args() -> argparse.Namespace:
     """Parse command line arguments."""
-    parser = argparse.ArgumentParser(description='Train GPT-2 on custom data')
+    parser = argparse.ArgumentParser(
+        description='Production-Ready GPT-2 Training Script',
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter
+    )
+    
+    # Configuration
+    parser.add_argument('--config', type=str, default=None,
+                        help='Path to YAML/JSON configuration file (overrides other args)')
     
     # Data arguments
     parser.add_argument('--data_dir', type=str, default='data',
@@ -134,11 +322,37 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument('--save_total_limit', type=int, default=3,
                         help='Maximum number of checkpoints to keep')
     
+    # Advanced checkpointing
+    parser.add_argument('--async_checkpoint', action='store_true',
+                        help='Enable async checkpoint saving (non-blocking)')
+    parser.add_argument('--checkpoint_compression', action='store_true',
+                        help='Enable checkpoint compression')
+    parser.add_argument('--save_optimizer_state', action='store_true', default=True,
+                        help='Save optimizer state in checkpoints')
+    parser.add_argument('--save_scheduler_state', action='store_true', default=True,
+                        help='Save scheduler state in checkpoints')
+    
+    # Early stopping
+    parser.add_argument('--early_stopping', action='store_true',
+                        help='Enable early stopping')
+    parser.add_argument('--early_stopping_patience', type=int, default=3,
+                        help='Early stopping patience')
+    parser.add_argument('--early_stopping_threshold', type=float, default=0.0,
+                        help='Minimum improvement threshold for early stopping')
+    
+    # Profiling
+    parser.add_argument('--profile', action='store_true',
+                        help='Enable PyTorch profiling')
+    parser.add_argument('--profile_steps', type=int, default=10,
+                        help='Number of steps to profile')
+    
     # Other
     parser.add_argument('--seed', type=int, default=42,
                         help='Random seed')
     parser.add_argument('--resume_from_checkpoint', type=str, default=None,
                         help='Resume training from checkpoint')
+    parser.add_argument('--experiment_name', type=str, default=None,
+                        help='Experiment name for tracking')
     
     return parser.parse_args()
 
@@ -163,18 +377,39 @@ def load_model_and_tokenizer(model_name: str, max_length: int):
 
 
 def main():
-    """Main training function."""
+    """Main training function with production features."""
     args = parse_args()
     
+    # Load config file if provided
+    config = None
+    if args.config:
+        logger.info(f"Loading configuration from {args.config}")
+        config = ExperimentConfig.load(args.config)
+        # Override args with config values
+        args.data_dir = config.data.data_dir
+        args.model_name = config.model.model_name
+        args.max_length = config.data.max_length
+        args.num_train_epochs = config.training.num_train_epochs
+        args.batch_size = config.training.batch_size
+        args.learning_rate = config.training.learning_rate
+        args.output_dir = config.training.output_dir
+        args.save_steps = config.training.save_steps
+        args.save_total_limit = config.checkpoint.keep_last_n
+        args.early_stopping = config.training.early_stopping
+        args.early_stopping_patience = config.training.early_stopping_patience
+    
     # Create output directory
-    output_path = Path(args.output_dir)
+    output_path = Path(args.output_dir).resolve()
     output_path.mkdir(parents=True, exist_ok=True)
+    
+    experiment_name = args.experiment_name or f"gpt2_finetune_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
     
     # Setup logging
     logger = setup_logging(args.output_dir)
     logger.info("=" * 60)
-    logger.info("GPT-2 Training Started")
+    logger.info("PRODUCTION GPT-2 TRAINING")
     logger.info("=" * 60)
+    logger.info(f"Experiment: {experiment_name}")
     logger.info(f"Configuration: {vars(args)}")
     
     # Set random seeds
@@ -183,8 +418,43 @@ def main():
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(args.seed)
     
+    # Initialize checkpoint manager
+    checkpoint_manager = CheckpointManager(
+        output_dir=args.output_dir,
+        save_total_limit=args.save_total_limit,
+        save_optimizer=args.save_optimizer_state,
+        save_scheduler=args.save_scheduler_state,
+        async_save=args.async_checkpoint,
+        compression=args.checkpoint_compression,
+    )
+    
+    # Initialize metrics tracker
+    metrics_tracker = MetricsTracker(
+        output_dir=args.output_dir,
+        experiment_name=experiment_name,
+    )
+    
+    # Save initial config for reproducibility
+    try:
+        initial_config = get_default_config()
+        initial_config.training.output_dir = args.output_dir
+        initial_config.training.num_train_epochs = args.num_train_epochs
+        initial_config.training.batch_size = args.batch_size
+        initial_config.model.model_name = args.model_name
+        initial_config.save(os.path.join(args.output_dir, "training_config.yaml"))
+    except Exception as e:
+        logger.warning(f"Could not save config: {e}")
+    
     # Load model and tokenizer
     model, tokenizer = load_model_and_tokenizer(args.model_name, args.max_length)
+    
+    # Model config for checkpoint metadata
+    model_config = {
+        "model_name": args.model_name,
+        "max_length": args.max_length,
+        "num_parameters": model.num_parameters(),
+        "gradient_checkpointing": args.gradient_checkpointing,
+    }
     
     # Create dataloader
     logger.info(f"\nLoading data from: {args.data_dir}")
@@ -252,6 +522,18 @@ def main():
         mlm=False,  # GPT-2 is causal LM, not masked LM
     )
     
+    # Training config for checkpoint metadata
+    training_config = {
+        "batch_size": args.batch_size,
+        "gradient_accumulation_steps": args.gradient_accumulation_steps,
+        "learning_rate": args.learning_rate,
+        "warmup_steps": args.warmup_steps,
+        "weight_decay": args.weight_decay,
+        "optimizer": args.optim,
+        "fp16": use_fp16,
+        "bf16": use_bf16,
+    }
+    
     # Initialize Trainer with CPU optimizations
     trainer = Trainer(
         model=model,
@@ -266,9 +548,37 @@ def main():
         trainer.model = torch.compile(trainer.model, mode='reduce-overhead')
         logger.info("torch.compile applied successfully")
     
-    # Remove default progress callback and add custom one
+    # Remove default progress callback and add production callback
     trainer.remove_callback(ProgressCallback)
-    trainer.add_callback(CustomProgressCallback())
+    
+    # Add production callback with checkpointing and metrics
+    production_callback = ProductionTrainerCallback(
+        checkpoint_manager=checkpoint_manager,
+        metrics_tracker=metrics_tracker,
+        model_config=model_config,
+        training_config=training_config,
+        early_stopping=args.early_stopping,
+        early_stopping_patience=args.early_stopping_patience,
+        early_stopping_threshold=args.early_stopping_threshold,
+    )
+    trainer.add_callback(production_callback)
+    
+    # Setup signal handlers for graceful shutdown
+    def signal_handler(signum, frame):
+        logger.info("\nReceived interrupt signal, saving checkpoint...")
+        checkpoint_manager.wait_for_async_saves()
+        trainer.save_model(os.path.join(args.output_dir, 'interrupted'))
+        tokenizer.save_pretrained(os.path.join(args.output_dir, 'interrupted'))
+        metrics_tracker.export_csv()
+        metrics_tracker.export_json()
+        logger.info("Checkpoint saved. Exiting gracefully.")
+        sys.exit(0)
+    
+    signal.signal(signal.SIGINT, signal_handler)
+    signal.signal(signal.SIGTERM, signal_handler)
+    
+    # Register cleanup on exit
+    atexit.register(lambda: checkpoint_manager.wait_for_async_saves())
     
     # Start training
     logger.info("\n" + "=" * 60)
@@ -277,24 +587,80 @@ def main():
     
     checkpoint = args.resume_from_checkpoint if args.resume_from_checkpoint else None
     
+    # Setup profiler if requested
+    if args.profile:
+        logger.info("PyTorch profiling enabled")
+        profile_schedule = torch.profiler.schedule(
+            wait=5,
+            warmup=5,
+            active=args.profile_steps,
+            repeat=1
+        )
+        profiler = torch.profiler.profile(
+            activities=[
+                torch.profiler.ProfilerActivity.CPU,
+                torch.profiler.ProfilerActivity.CUDA if torch.cuda.is_available() else None,
+            ],
+            schedule=profile_schedule,
+            on_trace_ready=torch.profiler.tensorboard_trace_handler(
+                os.path.join(args.output_dir, 'profiling')
+            ),
+            record_shapes=True,
+            profile_memory=True,
+            with_stack=True,
+        )
+        profiler.start()
+    
     try:
         trainer.train(resume_from_checkpoint=checkpoint)
+        
+        # Stop profiler
+        if args.profile:
+            profiler.stop()
+            logger.info(f"Profiling data saved to {os.path.join(args.output_dir, 'profiling')}")
         
         # Save final model
         logger.info("\nSaving final model...")
         trainer.save_model(args.output_dir)
         tokenizer.save_pretrained(args.output_dir)
         
+        # Export inference model
+        latest_checkpoint = checkpoint_manager.get_latest_checkpoint()
+        if latest_checkpoint:
+            inference_path = os.path.join(args.output_dir, 'inference_model.pt')
+            checkpoint_manager.export_checkpoint_for_inference(latest_checkpoint, inference_path)
+        
         logger.info(f"\n✓ Training completed successfully!")
         logger.info(f"Model saved to: {args.output_dir}")
         
     except KeyboardInterrupt:
         logger.info("\nTraining interrupted by user")
-        # Save checkpoint on interrupt
         logger.info("Saving checkpoint...")
+        checkpoint_manager.wait_for_async_saves()
         trainer.save_model(os.path.join(args.output_dir, 'interrupted'))
         tokenizer.save_pretrained(os.path.join(args.output_dir, 'interrupted'))
+        metrics_tracker.export_csv()
+        metrics_tracker.export_json()
         logger.info("Checkpoint saved")
+    
+    except Exception as e:
+        logger.error(f"\nTraining failed with error: {e}")
+        logger.error(traceback.format_exc())
+        
+        # Try to save checkpoint on error
+        try:
+            checkpoint_manager.wait_for_async_saves()
+            trainer.save_model(os.path.join(args.output_dir, 'error_checkpoint'))
+            tokenizer.save_pretrained(os.path.join(args.output_dir, 'error_checkpoint'))
+            logger.info("Emergency checkpoint saved")
+        except Exception as save_error:
+            logger.error(f"Failed to save emergency checkpoint: {save_error}")
+        
+        raise
+    
+    finally:
+        # Ensure async saves complete
+        checkpoint_manager.wait_for_async_saves()
     
     logger.info("=" * 60)
     logger.info("Training Finished")
