@@ -1,0 +1,83 @@
+experiment_name: gpt2_finetune
+run_id: '20260505_075922'
+notes: ''
+tags: []
+data:
+  data_dir: data
+  text_column: null
+  max_length: 512
+  streaming: false
+  num_workers: 0
+  train_test_split: 0.9
+  seed: 42
+model:
+  model_name: gpt2
+  tokenizer_name: null
+  vocab_size: null
+  n_positions: 1024
+  n_embd: 768
+  n_layer: 12
+  n_head: 12
+  gradient_checkpointing: false
+  compile_model: false
+training:
+  output_dir: ./models/gpt2-finetuned
+  num_train_epochs: 3
+  batch_size: 8
+  gradient_accumulation_steps: 4
+  learning_rate: 5.0e-05
+  warmup_steps: 1000
+  weight_decay: 0.01
+  max_grad_norm: 1.0
+  lr_scheduler_type: linear
+  optimizer: adamw_torch
+  fp16: false
+  bf16: false
+  save_steps: 500
+  save_total_limit: 3
+  save_strategy: steps
+  logging_steps: 100
+  logging_first_step: true
+  report_to: []
+  dataloader_num_workers: 0
+  dataloader_pin_memory: false
+  dataloader_prefetch_factor: null
+  eval_strategy: 'no'
+  eval_steps: null
+  per_device_eval_batch_size: null
+  load_best_model_at_end: true
+  metric_for_best_model: eval_loss
+  greater_is_better: false
+  early_stopping: false
+  early_stopping_patience: 3
+  early_stopping_threshold: 0.0
+  resume_from_checkpoint: null
+checkpoint:
+  enable: true
+  save_optimizer_state: true
+  save_scheduler_state: true
+  save_random_state: true
+  async_save: false
+  compression: false
+  remote_storage: null
+  keep_last_n: 3
+  save_every_n_epochs: 1
+distributed:
+  enable: false
+  backend: nccl
+  world_size: 1
+  rank: 0
+  local_rank: -1
+  master_addr: localhost
+  master_port: '29500'
+  gradient_bucket_size_mb: 25
+  static_graph: false
+profiling:
+  enable: false
+  profile_steps: 10
+  wait_steps: 5
+  warmup_steps: 5
+  active_steps: 5
+  trace_dir: ./profiling
+  export_chrome_trace: true
+  memory_profile: false
